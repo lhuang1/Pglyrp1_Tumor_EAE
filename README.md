@@ -1,6 +1,3 @@
 # Pglyrp1_Tumor_EAE
 
-
-Code and data will be available once the paper is in press. 
-
-Dear editors and reviewers -- please contact Linglin Huang (lhuang\@bwh.harvard.edu) for access to the private dev repo. Thank you!
+This repo contains code for "Targeting PGLYRP1, a novel member of the T cell co-inhibitory gene module, promotes antitumor immunity while inhibiting autoimmunity".

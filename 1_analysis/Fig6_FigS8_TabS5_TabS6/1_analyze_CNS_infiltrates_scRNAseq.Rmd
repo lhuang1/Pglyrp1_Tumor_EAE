@@ -1,0 +1,494 @@
+---
+title: "Analysis of single-cell RNA-seq data (CNS-infiltrating immune cells)"
+output: html_notebook
+---
+
+Preproduce scRNA-seq analyses in Figure 6, Supplementary Figure 8, Supplementary Table 5 and Supplemenatry Table 6. We use the data after cleaning in "GSE223873_eae_nonT_cleaned.rds".
+
+```{r, message=FALSE}
+rm(list = ls())
+library(Seurat)
+library(tidyverse)
+library(edgeR)
+library(pheatmap)
+library(openxlsx)
+library(ggsignif)
+library(cowplot)
+library(GSA)
+library(fgsea)
+library(gridExtra)
+library(ggrepel)
+library(Matrix)
+```
+
+Load and parse data.
+```{r}
+so <- readRDS("../../0_data/GSE223873_sc_RNAseq/GSE223873_eae_nonT_cleaned.rds")
+celltype_vec <- levels(so$annotation)
+table(so$annotation, useNA = "ifany")
+color_celltype <- c("Mono/MACS-1" = "#FFFF99",
+                     "Mono/MACS-2" = "#B15928",
+                     "Neutrophils-1" = "#A6CEE3",
+                     "Neutrophils-2" = "#1F78B4",
+                     "Microglia-1" = "#FDBF6F",
+                     "Microglia-2" = "#FF7F00",
+                     "B cells-1" = "#CAB2D6",
+                     "B cells-2" = "#6A3D9A",
+                     "DC1/DC2" = "#B2DF8A",
+                     "pDC" = "#006400",
+                     "DC3" = "#33A02C",
+                     "NK cells" = "#FB9A99",
+                     "Macrophages" = "#E31A1C",
+                     "Monocytes" = "#E7298A")
+color_genotype <- c("WT" = "#414042", "Pglyrp1-/-" = "#4391D4")
+```
+
+
+## Dimension reduction and clustering.
+
+Note the SCTransform, dimension reduction and clustering results may vary slightly for different R package versions. Therefore, we recommend using the precomputed results in the Seurat object "GSE223873_eae_nonT_cleaned.rds".
+
+```{r, eval=FALSE}
+# so <- SCTransform(so, return.only.var.genes = FALSE)
+# so <- RunPCA(so)
+# ElbowPlot(so, ndims = 50)
+# pc_dims <- 1:30
+# so <- FindNeighbors(so, assay = "SCT", reduction = "pca", dims = pc_dims, k.param = 20 )
+# so <- FindClusters(so, resolution = 0.3)
+# so <- RunUMAP(so, reduction = "pca", dims = pc_dims, n.neighbors = 30, min.dist = 0.5)
+```
+
+
+### Figure 6b
+An overview of the cell clusters in the dataset.
+```{r}
+plt_df <- data.frame(so@meta.data[,"annotation", drop = FALSE], 
+                     Embeddings(so, reduction = "umap"))
+
+p_ann <- ggplot(plt_df, aes(x = UMAP_1, y = UMAP_2, color = annotation)) +
+  geom_point(size = 0.1) +
+  labs(color = "Annotation") +
+  scale_color_manual(values = color_celltype[levels(plt_df$annotation)]) +
+  guides(color = guide_legend(override.aes = list(size = 2))) +
+  coord_fixed() +
+  theme_classic() 
+pdf("6b_umap_annotation.pdf", width = 6, height = 4)
+p_ann
+dev.off()
+```
+
+## Differential expression, gene set enrichment and cell type annotation.
+
+Identify differentially expressed genes in each cluster vs. all others.
+```{r}
+## filter genes
+prop_n0 <- sapply(celltype_vec, function(x) {
+  rowMeans(so[["RNA"]]@counts[,so$annotation == x] > 0)
+})
+keep_gene <- rowSums(prop_n0 > 0.1) > 0
+
+dge <- DGEList(counts = so[["RNA"]]@counts[keep_gene,], samples = so@meta.data)
+dge <- calcNormFactors(dge)
+dge <- estimateDisp(dge)
+dge$samples$cdr <- scale(dge$samples$nCount_RNA)
+dge$samples$channel <- factor(dge$samples$channel)
+
+res <- lapply(celltype_vec, function(x) {
+  cat(x, "\n")
+  dge$samples$ann_cur <- factor(dge$samples$annotation == x, levels = c("FALSE", "TRUE"))
+  if (nlevels(dge$samples$channel) > 1) {
+    design_mtx <- model.matrix(~ ann_cur + cdr + channel, data = dge$samples)  
+  } else {
+    design_mtx <- model.matrix(~ ann_cur + cdr, data = dge$samples)
+  }
+  qlf <- glmQLFit(dge, design = design_mtx)
+  qlt <- glmQLFTest(qlf, coef = "ann_curTRUE")
+  topTags(qlt, n = Inf, sort.by = "none")
+}) %>% `names<-`(celltype_vec)
+saveRDS(res, file = "1_diff_expr_cluster_vs_other.rds")
+```
+
+### Figure 6c
+```{r}
+# identify cluster-specific marker genes
+res <- readRDS("1_diff_expr_cluster_vs_other.rds")
+deg_df <- lapply(celltype_vec, function(x) {
+  res[[x]]$table %>% 
+    rownames_to_column("gene") %>% 
+    filter(logFC > log2(1.5), FDR < 0.05) %>% 
+    mutate(cluster = x) %>% 
+    top_n(20, wt = logFC)
+}) %>% Reduce(rbind,.)
+dim(deg_df)
+deg_df <- deg_df %>% 
+  arrange(-logFC) %>% 
+  filter(!duplicated(gene)) %>% 
+  filter(gene %in% rownames(so[["SCT"]]@scale.data)) %>% 
+  mutate(cluster = droplevels(factor(cluster, levels = celltype_vec))) %>% 
+  arrange(cluster)
+deg_vec <- deg_df$gene
+
+# confirm if celltype-defining genes of interest are in the
+genes_of_interest <- c("F13a1", "Lyz2", "Mki67", "S100a9", "S100a8", "Ly6g", "Cd177", "Nav3", "Cx3cr1", "Trem2", "Cd19", "Cd22", "Cd55", "H2-Ab1", "Cd74",
+                       "Tcf4", "Ccr7", "Fscn1", "Nkg7", "Klrg1", "Arg1", "Nos2", "Cd36")
+stopifnot(all(genes_of_interest %in% deg_vec))
+
+# make heatmap
+expr_mtx <- so[["SCT"]]@scale.data[deg_vec,order(so$annotation)]
+ann_cell <- so@meta.data[,c("annotation"), drop = FALSE] %>% `colnames<-`(c("Annotation"))
+ann_colors <- list(Annotation = color_celltype[levels(ann_cell$Annotation)])
+gaps_col <- cumsum(table(ann_cell$Annotation))
+gaps_row <- cumsum(table(deg_df$cluster))
+p <- pheatmap(expr_mtx,
+              color = colorRampPalette(c("magenta", "black", "gold"))(100),
+              breaks = seq(-2, 2, length.out = 101),
+              gaps_col = gaps_col,
+              fontsize_row = 3,
+              silent = TRUE,
+              cluster_cols = FALSE,
+              cluster_rows = FALSE,
+              annotation_col = ann_cell,
+              annotation_colors = ann_colors,
+              annotation_names_col = FALSE,
+              show_colnames = FALSE,
+              show_rownames = FALSE)
+pdf("6c_heatmap_cluster_markers_noNames.pdf", width = 8, height = 4)
+grid.arrange(p$gtable)
+dev.off()
+```
+
+### Supplementary Table 5
+Save differential expression results to.
+```{r}
+res <- readRDS("1_diff_expr_cluster_vs_other.rds")
+# print(names(res))
+wb <- createWorkbook()
+for (i in names(res)) {
+  sheet_name <- gsub("[^[:alnum:]]", "_", i)
+  addWorksheet(wb, sheet_name)
+  tmp <- res[[i]]$table %>% 
+    rownames_to_column("gene") %>% 
+    arrange(-logFC)
+  writeData(wb, sheet_name, tmp)
+}
+saveWorkbook(wb, file = "Table_S5.xlsx", overwrite = TRUE)
+
+```
+
+
+## Compare WT vs. Pglyrp1-/-
+
+### Supplementary Figure 8a
+Overview of the WT and Pglyrp1-/- cell distributions.
+```{r}
+set.seed(123)
+idx_sample <- sample(1:ncol(so), ncol(so), replace = FALSE)
+plt_df <- data.frame(so@meta.data[,"genotype", drop = FALSE], 
+                     Embeddings(so, reduction = "umap"))
+p <- ggplot(plt_df[idx_sample,], aes(x = UMAP_1, y = UMAP_2, color = genotype)) +
+  geom_point(size = 0.1) +
+  labs(color = "Genotype") +
+  scale_color_manual(values = color_genotype) +
+  guides(color = guide_legend(override.aes = list(size = 2))) +
+  coord_fixed() +
+  theme_classic() 
+pdf("s8a_umap_genotype.pdf", width = 6, height = 4)
+print(p)
+dev.off()
+```
+
+
+### Figure 6d
+Distance between WT and Pglyrp1-/- in every cluster, similar to Figure 3c bottom panel. Since Mono/MACS, Neutrophils, Micriglia, and B cells each have 2 subpopulations, we combine the subpopulations and only compute distance at cell type level.
+```{r}
+# combine subpopulations
+combined_celltype_vec <- unique(gsub("-.*", "", celltype_vec))
+combined_annotation <- gsub("-.*", "", so$annotation) %>% factor(., levels = combined_celltype_vec)
+combined_color_celltype <- color_celltype[!duplicated(gsub("-.*", "", names(color_celltype)))]
+names(combined_color_celltype) <- gsub("-.*", "", names(combined_color_celltype))
+
+# Find k-nearest neighbors (k = 20L by default)
+sim_nn_wt_ko <- sapply(combined_celltype_vec, function(x) {
+  is_celltype <- combined_annotation == x
+  
+  idx_celltype_wt <- which(is_celltype & so$genotype == "WT")
+  idx_celltype_ko <- which(is_celltype & so$genotype == "Pglyrp1-/-")
+  
+  sum(so@graphs$SCT_nn[idx_celltype_wt, idx_celltype_ko]) / length(idx_celltype_wt) / length(idx_celltype_ko)
+})
+dist_nn_wt_ko <- 1 / sim_nn_wt_ko
+
+
+p_dist <- data.frame(dist_nn_wt_ko) %>% 
+  rownames_to_column(var = "Annotation") %>% 
+  mutate(Annotation = factor(Annotation, levels = combined_celltype_vec, labels = combined_celltype_vec)) %>% 
+  ggplot(aes(x = Annotation, y = dist_nn_wt_ko, fill = Annotation)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  scale_fill_manual(values = combined_color_celltype, guide = "none") +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(title = "", x = "", y = "Distance") +
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 12))
+
+pdf("6d_barplot_distance.pdf", width = 6, height = 3)
+print(p_dist)
+dev.off()
+```
+
+
+### Differential expression
+
+Differential expression between WT and Pglyrp1-/- in Mono/MACs and Neutrophils. Related to Figure 6c, Supplementary Table 6, and Supplemenetary Figure 8b. Two Mono/MACs and two neutrophils subpopulations were combined.
+
+First, perform DE for mono/macs.
+```{r}
+so_mono <- so[,so$annotation %in% c("Mono/MACS-1", "Mono/MACS-2")]
+so_mono@meta.data <- droplevels(so_mono@meta.data)
+
+## prefilter genes
+gene_prefilter <- 0.1 # a gene should be detected by this proportion in at least one of the treatments
+prop_mat <- sapply(unique(so_mono$genotype), function(x){
+  rowMeans(so_mono[["RNA"]]@counts[,so_mono$genotype == x] > 0) 
+}) 
+keep <- rowSums(prop_mat > gene_prefilter) > 0
+so_mono <- subset(so_mono, features = which(keep))
+
+# run edgeR
+dge <- DGEList(so_mono[['RNA']]@counts, samples = so_mono@meta.data)
+dge$samples$cdr <- scale(dge$samples$nFeature_RNA)
+dge <- calcNormFactors(dge, method="TMM")
+design <- model.matrix(~ genotype + cdr, data = dge$samples)
+dge <- estimateDisp(dge, design = design)
+fit <- glmQLFit(dge, design = design)
+qlf <- glmQLFTest(fit, coef = "genotypePglyrp1-/-")
+res <- topTags(qlf, n = Inf, adjust.method = "BH", sort.by = "none", p.value = 1)
+saveRDS(res, file = "1_diff_expr_ko_vs_wt_monomacs.rds")
+```
+
+Next, perform DE for neutrophils.
+```{r}
+so_mono <- so[,so$annotation %in% c("Neutrophils-1", "Neutrophils-2")]
+so_mono@meta.data <- droplevels(so_mono@meta.data)
+
+## prefilter genes
+gene_prefilter <- 0.1 # a gene should be detected by this proportion in at least one of the treatments
+prop_mat <- sapply(unique(so_mono$genotype), function(x){
+  rowMeans(so_mono[["RNA"]]@counts[,so_mono$genotype == x] > 0) 
+}) 
+keep <- rowSums(prop_mat > gene_prefilter) > 0
+so_mono <- subset(so_mono, features = which(keep))
+
+# run edgeR
+dge <- DGEList(so_mono[['RNA']]@counts, samples = so_mono@meta.data)
+dge$samples$cdr <- scale(dge$samples$nFeature_RNA)
+dge <- calcNormFactors(dge, method="TMM")
+design <- model.matrix(~ genotype + cdr, data = dge$samples)
+dge <- estimateDisp(dge, design = design)
+fit <- glmQLFit(dge, design = design)
+qlf <- glmQLFTest(fit, coef = "genotypePglyrp1-/-")
+res <- topTags(qlf, n = Inf, adjust.method = "BH", sort.by = "none", p.value = 1)
+saveRDS(res, file = "1_diff_expr_ko_vs_wt_neutrophils.rds")
+```
+
+#### Supplementary Table 6
+```{r}
+res <- list(
+  "Mono-MAC" = readRDS("1_diff_expr_ko_vs_wt_monomacs.rds"),
+  "Neutrophil" = readRDS("1_diff_expr_ko_vs_wt_neutrophils.rds")
+)
+# print(names(res))
+wb <- createWorkbook()
+for (i in names(res)) {
+  addWorksheet(wb, i)
+  tmp <- res[[i]]$table %>% 
+    rownames_to_column("gene") %>% 
+    arrange(-logFC)
+  writeData(wb, i, tmp)
+}
+saveWorkbook(wb, file = "Table_S6.xlsx", overwrite = TRUE)
+```
+
+
+
+#### Figure 6e
+```{r}
+res <- list(
+  "Mono-MAC" = readRDS("1_diff_expr_ko_vs_wt_monomacs.rds"),
+  "Neutrophil" = readRDS("1_diff_expr_ko_vs_wt_neutrophils.rds")
+)
+
+thresh_padj <- 0.05
+thresh_lfc <- 0.25
+min_range_abs <- 2.5
+min_logFC <- -min_range_abs
+max_logFC <- min_range_abs
+min_nlog10p <- 0
+max_nlog10p <- 30
+
+n_top <- 20
+
+gene_to_plot_ls <- list(
+  "Mono-MAC" = c("Gm14548", "Ccl4", "Gm15448", "Hspa1b", "Hspa1a",
+                  "Sla", "Nisch", "Pira2", "Gm42418", "Cyb561a3", "Ufsp2",
+                  "Apoe", "Pglyrp1", "Apoc2", "Slc7a2", "Igkv14-111",
+                  "Cfb", "C1qb", "Gatm", "Acod1", "Malt1",
+                  "Cd274", "Pirb", "Nrp2", "Cemip2", "Ltf", 
+                  "Tgm2", "Socs1", "Psmd8", "Cxcl10", "Selenop", 
+                  "Fth1", "Calm3"), 
+  "Neutrophil" = c("Igkv1-135", "Ifit3", "Blvrb", "Ifi27l2a", "Gm14548", "Slfn5", 
+                    "Cstdc4", "Ifit1", "Mt1", "Ifit3b", "Myadm", "Tmem71", 
+                    "Slfn2", "Csf1", "Bcl3", "Ifi204", "Tnfaip2", "Irf7",
+                    "Pglyrp1", "Camp", "Apoe", "Igkv14-111", "Pirb", "Cd74", "Sod2",
+                    "Lta4h", "Ngp", "Chil3", "H2-Aa", "Capg", "Lgals3")
+)
+
+
+## volcano plot for subtype comparison
+plist <- lapply(names(res), function(i) {
+  plt_df <- res[[i]]$table %>% 
+    rownames_to_column(var = "gene") %>% 
+    mutate(logFC_cap = pmax(pmin(logFC, max_logFC), min_logFC),
+           nlog10p = -log10(PValue),
+           nlog10p_cap = pmax(pmin(nlog10p, max_nlog10p, na.rm = T), min_nlog10p, na.rm = T),
+           up_in = ifelse(FDR >= thresh_padj, "NS", 
+                          ifelse(logFC > thresh_lfc, "Pglyrp1-/-", 
+                                 ifelse(logFC < -thresh_lfc, "WT", "NS"))) %>% factor(levels = c("Pglyrp1-/-", "WT", "NS")),
+           label = ifelse(gene %in% gene_to_plot_ls[[i]], gene, NA),
+           frame_type = ifelse(is.na(label), as.character(up_in), "highlight")) %>% 
+    arrange(-as.numeric(up_in), -is.na(label))
+
+  ggplot(plt_df, aes(x = logFC_cap, y = nlog10p_cap, fill = up_in, label = label)) +
+    geom_point(aes(color = frame_type), shape = 21) +
+    geom_text_repel(size = 4, show.legend = FALSE, min.segment.length = 0.1, color = "black") +
+    scale_fill_manual(values = c(color_genotype, "NS" = "grey85")) +
+    scale_color_manual(values = c("highlight" = "#F2CF5D", color_genotype, "NS" = "grey85"), guide = "none") +
+    scale_size_manual(values = c("Pglyrp1-/-" = 1, "WT" = 1, "NS" = 0.5), guide = "none") +
+    guides(fill = guide_legend(override.aes = list(color = NA, size = c(4, 4, 4)))) +
+    labs(x = "Log2 Fold Change (Pglyrp1-/- vs. WT)", y = "-log10(pvalue)", fill = "Upregulated in") +
+    theme_classic() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+          legend.title = element_text(size = 12),
+          legend.text = element_text(size = 12),
+          axis.title = element_text(size = 14),
+          axis.text = element_text(size = 12))
+})
+
+pdf("6e_volcano_ko_vs_wt.pdf", width = 14, height = 5)
+grid.arrange(grobs = plist, nrow = 1)
+dev.off()
+```
+
+#### Supplementary Figure 8b.
+
+```{r}
+thresh_fdr <- 0.05
+thresh_lfc <- 0.25
+
+res_mono <- readRDS("1_diff_expr_ko_vs_wt_monomacs.rds")$table
+res_mono <- res_mono[order(res_mono$FDR),]
+res_neutro <- readRDS("1_diff_expr_ko_vs_wt_neutrophils.rds")$table
+res_neutro <- res_neutro[order(res_neutro$FDR),]
+
+deg <- list(
+  "Pglyrp1-/- Mono/MACS" = rownames(res_mono)[res_mono$logFC > thresh_lfc & res_mono$FDR < thresh_fdr],
+  "WT Mono/MACS" = rownames(res_mono)[res_mono$logFC < -thresh_lfc & res_mono$FDR < thresh_fdr],
+  "Pglyrp1-/- Neutrophils" = rownames(res_neutro)[res_neutro$logFC > thresh_lfc & res_neutro$FDR < thresh_fdr],
+  "WT Neutrophils" = rownames(res_neutro)[res_neutro$logFC < -thresh_lfc & res_neutro$FDR < thresh_fdr]
+)
+
+lengths(deg)
+
+deg_wt <- union(deg$`WT Mono/MACS`, deg$`WT Neutrophils`)
+pdf("s8b_top_venn_wt.pdf")
+vennDiagram(vennCounts(data.frame("Mono/MACS" = deg_wt %in% deg$`WT Mono/MACS`,
+                                  "Neutrophils" = deg_wt %in% deg$`WT Neutrophils`)))
+dev.off()
+intersect(deg$`WT Mono/MACS`, deg$`WT Neutrophils`) %>% cat(sep = ", ") %>% cat("\n")
+
+deg_ko <- union(deg$`Pglyrp1-/- Mono/MACS`, deg$`Pglyrp1-/- Neutrophils`)
+pdf("s8b_bottom_venn_ko.pdf")
+vennDiagram(vennCounts(data.frame("Mono/MACS" = deg_ko %in% deg$`Pglyrp1-/- Mono/MACS`,
+                                  "Neutrophils" = deg_ko %in% deg$`Pglyrp1-/- Neutrophils`)))
+dev.off()
+intersect(deg$`Pglyrp1-/- Mono/MACS`, deg$`Pglyrp1-/- Neutrophils`) %>% cat(sep = ", ") %>% cat("\n")
+```
+
+### Figure 6f
+
+Gene set enrichment comparing Pglyrp1-/- vs. WT in mono/macs and neutrophils, respectively. Terms to plot were selected based on biological relevance and enrichment test statistics -- selected terms are `gsea_ko_vs_wt_to_plot.csv`. Note that the numerical results may be different from those shown in the paper, and may even vary slightly at every run. This is because the fGSEA package has randomness from various sources, such as permutations, arbitrary ordering of ties in the GSEA preranked stats (see fGSEA documentation). However, the overall conclusions should be consistent.
+
+```{r}
+res <- list(
+  "Mono-MAC" = readRDS("1_diff_expr_ko_vs_wt_monomacs.rds"),
+  "Neutrophil" = readRDS("1_diff_expr_ko_vs_wt_neutrophils.rds")
+)
+# load gene sets
+sink("/dev/null") #suppress verbose outputs
+gs_raw <- list(
+  "KeggReactome" = GSA.read.gmt("../../0_data/gene_lists/from_msigdb/c2.kegg.reactome.v7.0.symbols.gmt"),
+  "GoTerms" = GSA.read.gmt("../../0_data/gene_lists/from_msigdb/c5.all.v7.0.symbols.gmt"),
+  "c7Immune" = GSA.read.gmt("../../0_data/gene_lists/from_msigdb/c7.all.v7.0.symbols.gmt"),
+  "Literature" = GSA.read.gmt("../../0_data/gene_lists/literature.symbols.gmt")
+)
+sink()
+
+fgsea_res_ls <- sapply(names(res), simplify = FALSE, FUN = function(x) {
+  all_genes_upper <- toupper(rownames(res[[x]]$table))
+  lapply(names(gs_raw), function(db) {
+    gs_parsed_db <- lapply(gs_raw[[db]]$genesets, function(x) {
+      intersect(toupper(x), all_genes_upper)
+    }) %>% `names<-`(gs_raw[[db]]$geneset.names)
+    de_stat <- res[[x]]$table$`F` * ((res[[x]]$table$logFC > 0) * 2 - 1) # polarize based on DE direction
+    names(de_stat) <- all_genes_upper
+    fgsea_results <- fgsea(pathways = gs_parsed_db, stats = de_stat)
+    fgsea_results %>% 
+      mutate(database = db,
+             cluster = x) %>% 
+      arrange(pval)
+  }) %>% `names<-`(names(gs_raw))
+})
+saveRDS(fgsea_res_ls, "1_gsea_ko_vs_wt.rds")
+
+## make figure 6f
+to_plot <- read.csv("gsea_ko_vs_wt_to_plot.csv")
+
+
+results <- Reduce(rbind, unlist(fgsea_res_ls, recursive = FALSE))
+plt_df <- merge(results, to_plot, by = c("pathway", "cluster"), all = FALSE)  
+
+map_pval <- function(p_vec) {
+  p_mapped <- paste0("p=", formatC(p_vec, format = "E", digits = 2))
+  return(p_mapped)
+}
+
+plist <- sapply(names(fgsea_res_ls), simplify = FALSE, FUN = function(x) {
+  plt_df_sub <- plt_df %>% 
+    filter(cluster == x) %>% 
+    arrange(NES) %>% 
+    mutate(name = factor(name, levels = name))
+  ggplot(plt_df_sub, aes(x = name, y = NES, fill = direction)) +
+    geom_bar(stat = "identity", width = 0.7) +
+    geom_hline(yintercept = 0) +
+    geom_text(aes(y = ifelse(NES > 0, -1.9, 0.1), label = map_pval(pval)), hjust = 0) +
+    scale_fill_manual(values = color_genotype) +
+    labs(x = "", y = "NES", fill = "", title = sub("-", "/", x)) +
+    coord_flip() +
+    theme_classic() +
+    theme(strip.background = element_blank(),
+          axis.text.y = element_text(color = "black", size = 11), 
+          axis.line.y = element_blank(),
+          axis.ticks.y = element_blank())
+})
+
+pdf("6f_barplot_gsea_ko_vs_wt.pdf", width = 14, height = 5)
+grid.arrange(grobs = lapply(plist, function(p) {p + theme(legend.position = "none")}), 
+             nrow = 1, right = get_legend(plist[[1]]))
+dev.off()
+```
+
+

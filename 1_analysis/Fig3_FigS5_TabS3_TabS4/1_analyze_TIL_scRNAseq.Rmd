@@ -1,0 +1,729 @@
+---
+title: "Analysis of single-cell RNA-seq data (tumor-infiltrating immune cells)"
+output: html_notebook
+---
+
+Reproduce scRNA-seq analyses in Figure 3, Supplementary Figure 5, Supplementary Table 3, and Supplemenatry Table 4 using the clean and preprocessed data in "GSE223873_tumor_T_cleaned.rds".
+
+```{r, message=FALSE}
+rm(list = ls())
+library(Seurat)
+library(tidyverse)
+library(edgeR)
+library(pheatmap)
+library(openxlsx)
+library(ggsignif)
+library(cowplot)
+library(GSA)
+library(fgsea)
+library(gridExtra)
+library(ggrepel)
+```
+
+Load and parse data.
+```{r}
+so <- readRDS("../../0_data/GSE223873_sc_RNAseq/GSE223873_tumor_T_cleaned.rds")
+color_celltype <- c("CD4+ Tconv" = "#EE756C", "Stem-like CD8+ T cells" = "#EF8FEB", "Effector/Exhausted CD8+ T cells" = "#639AF8", "CD8+ T cells" = "#55BC39", "Tregs" = "#58C0C5")
+color_genotype <- c("WT" = "#414042", "Pglyrp1-/-" = "#4391D4")
+
+celltype_vec <- names(color_celltype)
+```
+
+
+## Dimension reduction and clustering.
+
+Note the SCTransform, dimension reduction and clustering results may vary slightly for different R package versions. Therefore, we recommend using the precomputed results in the Seurat object "GSE223873_tumor_T_cleaned.rds".
+
+<!-- ```{r} -->
+<!-- so <- SCTransform(so, return.only.var.genes = FALSE) -->
+<!-- so <- RunPCA(so) -->
+<!-- ElbowPlot(so, ndims = 50) -->
+<!-- pc_dims <- 1:30 -->
+<!-- so <- FindNeighbors(so, assay = "SCT", reduction = "pca", dims = pc_dims, k.param = 20 ) -->
+<!-- so <- FindClusters(so, resolution = 0.3) -->
+<!-- so <- RunUMAP(so, reduction = "pca", dims = pc_dims, n.neighbors = 30, min.dist = 0.5) -->
+<!-- ``` -->
+
+### Figure 3a
+An overview of the cell clusters in the dataset.
+```{r}
+plt_df <- data.frame(so@meta.data[,"annotation", drop = FALSE], 
+                     Embeddings(so, reduction = "umap"))
+
+p_ann <- ggplot(plt_df, aes(x = UMAP_1, y = UMAP_2, color = annotation)) +
+  geom_point(size = 0.5) +
+  labs(color = "Annotation") +
+  scale_color_manual(values = color_celltype[levels(plt_df$annotation)]) +
+  guides(color = guide_legend(override.aes = list(size = 2))) +
+  coord_fixed() +
+  theme_classic() 
+pdf("3a_umap_annotation.pdf", width = 6, height = 4)
+p_ann
+dev.off()
+```
+
+
+## Differential expression, gene set enrichment and cell type annotation.
+
+Identify differentially expressed genes in each cluster vs. all others.
+```{r}
+# filter lowly expressed genes
+prop_n0 <- sapply(levels(so$annotation), function(x) {
+  rowSums(so[["RNA"]]@counts[,so$annotation == x] > 0)
+})
+keep_gene <- rowSums(prop_n0 > 0.1) > 0
+table(keep_gene)
+
+# prep object for edgeR
+so$cdr <- scale(so$nCount_RNA)
+so$channel <- factor(so$channel)
+
+dge <- DGEList(counts = so[["RNA"]]@counts[keep_gene,], samples = so@meta.data)
+dge <- calcNormFactors(dge)
+dge <- estimateDisp(dge)
+
+res <- sapply(levels(so$annotation), simplify = FALSE, FUN = function(x) {
+  cat(x, "\n")
+  dge$samples$ann_cur <- factor(dge$samples$annotation == x, levels = c("FALSE", "TRUE"))
+  design_mtx <- model.matrix(~ ann_cur + cdr + channel, data = dge$samples)
+  qlf <- glmQLFit(dge, design = design_mtx)
+  qlt <- glmQLFTest(qlf, coef = 2)
+  topTags(qlt, n = Inf, sort.by = "none")
+}) 
+saveRDS(res, file = "1_diff_expr_cluster_vs_other.rds")
+```
+
+### Supplementary Figure 5a
+```{r}
+# identify cluster-specific marker genes
+res <- readRDS("1_diff_expr_cluster_vs_other.rds")
+deg_df <- lapply(names(res), function(x) {
+  res[[x]]$table %>% 
+    rownames_to_column("gene") %>% 
+    filter(logFC > log2(1.5), FDR < 0.05) %>% 
+    mutate(annotation = x)
+}) %>% 
+  Reduce(rbind,.) %>% 
+  arrange(-logFC) %>% 
+  filter(!duplicated(gene)) %>% # only keep the one with higher logFC
+  filter(gene %in% rownames(so[["SCT"]]@scale.data)) %>% # make sure the SCTransformed data is available
+  mutate(annotation = droplevels(factor(annotation, levels = celltype_vec))) %>% 
+  droplevels() %>% 
+  arrange(annotation)
+deg_vec <- deg_df$gene
+length(deg_vec)
+
+# confirm if celltype-defining genes of interest are in the
+genes_of_interest <- c("Cd28", "Cd4", 
+                       "Runx3", "Cd8a", 
+                       "Stat4", "Cd44", "Slamf7", "Ifngr1", 
+                       "Ctla4", "Icos", "Il2ra", "Nrp1", "Il10ra", "Itgae", "Foxp3")
+stopifnot(all(genes_of_interest %in% deg_vec))
+
+# make heatmap
+expr_mtx <- so[["SCT"]]@scale.data[deg_vec,]
+ann_cell <- so@meta.data[,c("annotation"), drop = FALSE]
+ann_colors <- list(annotation = color_celltype[levels(ann_cell$annotation)])
+gaps_col <- cumsum(table(ann_cell$annotation))
+gaps_row <- cumsum(table(deg_df$annotation))
+
+pdf("s5a_heatmap_cluster_markers_noNames.pdf", width = 8, height = 4)
+pheatmap(expr_mtx[,order(ann_cell$annotation)],
+        color = colorRampPalette(c("magenta", "black", "gold"))(100),
+        breaks = seq(-2, 2, length.out = 101),
+        gaps_col = gaps_col,
+        gaps_row = gaps_row,
+        fontsize_row = 3,
+        silent = FALSE,
+        cluster_cols = FALSE,
+        cluster_rows = FALSE,
+        annotation_col = ann_cell,
+        annotation_colors = ann_colors,
+        annotation_names_col = FALSE,
+        show_colnames = FALSE,
+        show_rownames = FALSE)
+dev.off()
+```
+
+### Supplementary Table 3
+Save differential expression results to.
+```{r}
+res <- readRDS("1_diff_expr_cluster_vs_other.rds")
+# print(names(res))
+wb <- createWorkbook()
+for (i in names(res)) {
+  sheet_name <- gsub("[^[:alnum:]]", "_", i)
+  addWorksheet(wb, sheet_name)
+  tmp <- res[[i]]$table %>% 
+    rownames_to_column("gene") %>% 
+    arrange(-logFC)
+  writeData(wb, sheet_name, tmp)
+}
+saveWorkbook(wb, file = "Table_S3.xlsx", overwrite = TRUE)
+```
+
+### Supplementary Figure 5b
+Further compare the WT cells in the two CD8+ T cell clusters using differential expression followed by gene set enrichment analysis.
+```{r}
+## differential expression
+cd8_vec <- c("Stem-like CD8+ T cells", "Effector/Exhausted CD8+ T cells") # the two CD8+ T cell clusters of interest
+so_cd8_wt <- so[,(so$annotation %in% cd8_vec) & (so$genotype == "WT")]
+so_cd8_wt@active.assay <- "RNA"
+so_cd8_wt@meta.data <- droplevels(so_cd8_wt@meta.data)
+
+
+## prefilter genes
+gene_prefilter <- 0.1 # a gene should be detected by this proportion in at least one of the genotype
+prop_mat <- sapply(unique(so_cd8_wt$genotype), function(x){
+  rowMeans(so_cd8_wt@assays$RNA@counts[,so_cd8_wt$genotype == x] > 0) 
+}) 
+keep <- rowSums(prop_mat > gene_prefilter) > 0
+so_cd8_wt <- so_cd8_wt[keep,]
+dim(so_cd8_wt)
+
+# run edgeR
+# Create a DGEList data object.
+dge <- DGEList(so_cd8_wt[["RNA"]]@counts, samples = so_cd8_wt@meta.data)
+dge$samples$cdr <- scale(dge$samples$nFeature_RNA)
+dge <- calcNormFactors(dge, method="TMM")
+design <- model.matrix(~ annotation + channel + cdr, data = dge$samples)
+dge <- estimateDisp(dge, design = design)
+fit <- glmQLFit(dge, design = design)
+qlf <- glmQLFTest(fit, coef = 2)
+de_res <- topTags(qlf, n = Inf, adjust.method = "BH", sort.by = "none", p.value = 1)
+saveRDS(de_res, "1_diff_expr_CD8_effector_vs_stem.rds")
+```
+
+Gene set enrichment anlaysis.
+```{r}
+de_res <- readRDS("1_diff_expr_CD8_effector_vs_stem.rds")
+# load gene sets
+sink("/dev/null") #suppress verbose outputs
+gs_raw <- list(
+  "KeggReactome" = GSA.read.gmt("../../0_data/gene_lists/from_msigdb/c2.kegg.reactome.v7.0.symbols.gmt"),
+  "GoTerms" = GSA.read.gmt("../../0_data/gene_lists/from_msigdb/c5.all.v7.0.symbols.gmt"),
+  "c7Immune" = GSA.read.gmt("../../0_data/gene_lists/from_msigdb/c7.all.v7.0.symbols.gmt"),
+  "Literature" = GSA.read.gmt("../../0_data/gene_lists/literature.symbols.gmt")
+)
+sink()
+## add exhaustion related signatures to "Literature"
+f_exh <- "../../0_data/gene_lists/exhaustion_signatures.xlsx"
+sig_ex_info <- read.xlsx(f_exh, sheet = "info")
+sig_ex_ls <- lapply(sig_ex_info$sheet_name, function(x) {
+  read.xlsx(f_exh, sheet = x, colNames = FALSE)[,1]
+})
+gs_raw$Literature$genesets <- c(gs_raw$Literature$genesets, sig_ex_ls)
+gs_raw$Literature$geneset.names <- c(gs_raw$Literature$geneset.names, sig_ex_info$signature_name)
+gs_raw$Literature$geneset.descriptions <- c(gs_raw$Literature$geneset.descriptions, sig_ex_info$website)
+
+## perform GSEA 
+all_genes_upper <- toupper(rownames(de_res$table))
+fgsea_res_ls <- lapply(names(gs_raw), 
+  function(db) {
+    cat(db, "...\n")
+    gs_parsed_db <- lapply(gs_raw[[db]]$genesets, function(x) {
+      intersect(toupper(x), all_genes_upper)
+    }) %>% `names<-`(gs_raw[[db]]$geneset.names)
+    de_stat <- de_res$table$`F` * ((de_res$table$logFC > 0) * 2 - 1) # polarize based on DE direction
+    names(de_stat) <- all_genes_upper
+    fgsea_results <- fgsea(pathways = gs_parsed_db, stats = de_stat)
+    fgsea_results %>% 
+      mutate(database = db) %>% 
+      arrange(pval)
+}) %>% `names<-`(names(gs_raw))
+saveRDS(fgsea_res_ls, "1_gsea_CD8_effector_vs_stem.rds")
+```
+
+Visualize GSEA results for selected gene sets. Selection was based on test significance and biological relevance. Selected terms are available in "gsea_terms_to_plot_CD8_effector_vs_stem.csv". Note that the numerical results may be different from those shown in the paper, and may even vary slightly at every run. This is because the fGSEA package has randomness from various sources, such as permutations, arbitrary ordering of ties in the GSEA preranked stats (see fGSEA documentation). However, the overall conclusions should be consistent.
+
+```{r}
+fgsea_res_ls <- readRDS("1_gsea_CD8_effector_vs_stem.rds")
+to_plot <- read.csv("gsea_terms_to_plot_CD8_effector_vs_stem.csv")
+
+to_plot$up_in <- factor(to_plot$up_in, levels = celltype_vec) %>% droplevels()
+
+map_pval <- function(p_vec) {
+  p_mapped <- paste0("p=", formatC(p_vec, format = "E", digits = 2))
+  return(p_mapped)
+}
+
+plt_df <- Reduce(union, fgsea_res_ls) %>% 
+  merge(., to_plot, by = "pathway", all = FALSE)  %>% 
+  mutate(NES = - NES) %>% ## such that CD8-1 specific terms are positive
+  arrange(NES) %>% 
+  mutate(name_for_plot = factor(name_for_plot, levels = name_for_plot))
+
+p <- ggplot(plt_df, aes(x = name_for_plot, y = NES, fill = up_in)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_hline(yintercept = 0) +
+  geom_text(aes(y = ifelse(NES > 0, -1, 0.1), label = map_pval(pval)), hjust = 0) +
+  facet_grid(db_type~., scale = "free", space = "free") +
+  scale_fill_manual(values = color_celltype[levels(plt_df$up_in)]) +
+  labs(x = "", y = "NES", fill = "") +
+  coord_flip() +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        axis.text.y = element_text(color = "black", size = 12), 
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+pdf("s5b_barplot_enrichment_CD8_stem_vs_effector.pdf", width = 10, height = 10)
+p
+dev.off()
+
+```
+
+### Supplementary Figure 5c
+RNA velocity trajectory analysis between the two CD8+ T cell clusters. Code is available in "5c_RNA_velocity/".
+
+### Figure 3b
+Compare the expression of Pglyrp1 in different clusters (in WT cells only).
+```{r}
+so_wt <- so[,so$genotype == "WT"]
+
+plt_df <- data.frame(Annotation = so_wt@meta.data$annotation, 
+                     Expression = as.numeric(so_wt[["SCT"]]@data["Pglyrp1",])) 
+
+# violin plot
+p_vln <- ggplot(plt_df, aes(x = Annotation, y = Expression, fill = Annotation)) +
+  geom_violin(scale = "width") +
+  geom_jitter(size = 0.5, height = 0.1, color = "grey50") +
+  geom_signif(comparisons = list(c("CD4+ Tconv", "Stem-like CD8+ T cells"),
+                                 c("CD4+ Tconv", "Effector/Exhausted CD8+ T cells"),
+                                 c("CD4+ Tconv", "Tregs"),
+                                 c("Stem-like CD8+ T cells", "Effector/Exhausted CD8+ T cells"),
+                                 c("Stem-like CD8+ T cells", "Tregs")),
+              step_increase = 0.1) +
+  scale_fill_manual(values = color_celltype[levels(so_wt$annotation)], guide = "none") +
+  labs(x = "", y = "Pglyrp1 expression", title = "") +
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+        axis.title = element_text(size = 14),
+        axis.text.x = element_blank(),#element_text(size = 12, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 12))
+
+# dot plot
+p_dot <- plt_df %>% 
+  group_by(Annotation) %>% 
+  summarise(pct_det = 100 * mean(Expression > 0),
+            avg_expr = mean(Expression)) %>% 
+  ggplot(aes(x = Annotation, y = "Pglyrp1", size = pct_det, fill = avg_expr)) +
+  geom_point(shape = 21) +
+  scale_fill_gradient(low = "grey80", high = "blue") +
+  scale_size(range = c(1, 10)) +
+  labs(x = "", y = "", fill = "Avg. expression", size = "% cell detected") +
+  theme_classic() +
+  guides(fill = guide_colourbar(label.theme = element_text(size = 10, angle = 45, hjust = 1))) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+        legend.position = "bottom",
+        axis.title = element_text(size = 14),
+        axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+pdf("3b_pglyrp1_expression.pdf", width = 7, height = 9)
+plot_grid(p_vln, p_dot, ncol = 1, align = "v", rel_heights = c(0.5, 0.5))
+dev.off()
+
+```
+
+
+## Compare WT vs. Pglyrp1-/-
+
+Measure and compare the differences between WT and Pglyrp1-/- across clusters. Two measurements were computed: (1) number of differentially expressed genes; (2) dissimilarity of the nearest neighbors in the principle component space. Related to Figure 3c.
+
+Differential expression between WT and Pglyrp1-/-, stratified by cluster. Also include a supercluter that contains both CD8+ T cells clusters.
+```{r}
+## prefilter genes
+gene_prefilter <- 0.1 # a gene should be detected by this proportion in at least one of the genotypes
+prop_mat <- sapply(unique(so$genotype), function(x){
+  rowMeans(so[["RNA"]]@counts[,so$genotype == x] > 0) 
+}) 
+keep <- rowSums(prop_mat > gene_prefilter) > 0
+so@active.assay <- "RNA"
+so_filt <- so[keep,]
+
+# Create a DGEList data object.
+dgeFull <- DGEList(so_filt[["RNA"]]@counts, samples = so_filt@meta.data)
+dgeFull$samples$cdr <- scale(dgeFull$samples$nFeature_RNA)
+
+de_res <- sapply(celltype_vec, simplify = FALSE, FUN = function(celltype) {
+  cat("\n\n=========", celltype, "============\n")
+  if (celltype == "CD8+ T cells") {
+    dge <- dgeFull[,dgeFull$samples$annotation %in% grep("CD8+", celltype_vec, value = TRUE)]
+  } else {
+    dge <- dgeFull[,dgeFull$samples$annotation == celltype]
+  }
+  dge <- calcNormFactors(dge, method="TMM")
+  design <- model.matrix(~ genotype + channel + cdr, data = dge$samples)
+  dge <- estimateDisp(dge, design = design)
+  fit <- glmQLFit(dge, design = design)
+  qlf <- glmQLFTest(fit, coef = 2)
+  topTags(qlf, n = Inf, adjust.method = "BH", sort.by = "none", p.value = 1)
+})
+
+saveRDS(de_res, "1_diff_expr_WT_vs_KO_by_cluster.rds")
+```
+
+
+### Table S4
+Save differential expression results.
+```{r}
+de_res <- readRDS("1_diff_expr_WT_vs_KO_by_cluster.rds")
+wb <- createWorkbook()
+for (i in names(de_res)) {
+  sheet_name <- gsub("[^[:alnum:]]", "_", i)
+  addWorksheet(wb, sheet_name)
+  tmp <- de_res[[i]]$table %>% 
+    rownames_to_column("gene") %>% 
+    arrange(-logFC)
+  writeData(wb, sheet_name, tmp)
+}
+saveWorkbook(wb, file = "Table_S4.xlsx", overwrite = TRUE)
+```
+
+
+
+Compute cluster latent space distance. The distance was computed using the K-Nearest Neighbor graph built in the PC space. Note the results may vary slightly for different R package versions, but the trends remain invariant.
+```{r}
+# Find k-nearest neighbors (k = 20L by default) if KNN is not in the object
+pc_dims <- 1:30 ## use the same dimensions as clustering
+so <- FindNeighbors(so, reduction = "pca", dims = pc_dims)
+
+# edge density across WT and KO cells.
+sim_nn_wt_ko <- sapply(celltype_vec, function(x) {
+  if (x == "CD8+ T cells") {
+    is_celltype <- grepl("CD8", so$annotation)
+  } else {
+    is_celltype <- so$annotation == x
+  }
+  
+  idx_celltype_wt <- which(is_celltype & so$genotype == "WT")
+  idx_celltype_ko <- which(is_celltype & so$genotype == "Pglyrp1-/-")
+  n_overlap <- (sum(so@graphs$SCT_nn[idx_celltype_wt, idx_celltype_ko]) + sum(so@graphs$SCT_nn[idx_celltype_ko, idx_celltype_wt])) 
+  n_total <- length(idx_celltype_wt) * length(idx_celltype_ko) * 2
+  n_overlap / n_total
+})
+dist_nn_wt_ko <- 1 / sim_nn_wt_ko
+saveRDS(dist_nn_wt_ko, "1_distance_wt_ko.rds")
+```
+
+### Figure 3c
+```{r}
+de_res <- readRDS("1_diff_expr_WT_vs_KO_by_cluster.rds")
+celltype_vec_reorder <- c("CD4+ Tconv", "Tregs", "Stem-like CD8+ T cells", "Effector/Exhausted CD8+ T cells", "CD8+ T cells")
+
+# Number of DE genes
+thresh_lfc <- 0.25
+thresh_fdr <- 0.05
+plt_df <- sapply(names(de_res), function(x) {
+  tmp <- de_res[[x]]$table
+  n <- sum((tmp$FDR < thresh_fdr) & (abs(tmp$logFC) > thresh_lfc))
+}) %>% 
+  as.data.frame() %>% 
+  `colnames<-`("n_deg") %>% 
+  rownames_to_column(var = "celltype") %>% 
+  mutate(celltype = factor(celltype, levels = celltype_vec_reorder))
+p_deg <- ggplot(plt_df, aes(x = celltype, y = n_deg, fill = celltype)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  scale_fill_manual(values = color_celltype[celltype_vec_reorder], guide = "none") +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(title = "", x = "", y = "Number of DE genes") +
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size = 12))
+
+## Distance
+dist_nn_wt_ko <- readRDS("1_distance_wt_ko.rds")
+plt_df <- data.frame(dist_nn_wt_ko) %>% 
+  rownames_to_column(var = "celltype") %>% 
+  mutate(celltype = factor(celltype, levels = celltype_vec_reorder))
+p_dist <- ggplot(plt_df, aes(x = celltype, y = dist_nn_wt_ko, fill = celltype)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  scale_fill_manual(values = color_celltype[celltype_vec_reorder], guide = "none") +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(title = "", x = "", y = "Distance") +
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 12))
+
+pdf("3c_barplot_ndeg_distance.pdf", width = 5, height = 7)
+plot_grid(p_deg, NULL, p_dist, align = "h", ncol = 1, rel_heights = c(1, -0.45, 1))
+dev.off()
+```
+
+### Figure 3d
+Quantify the differences in cell type composition between WT and Pglyrp1-/- mice.
+```{r}
+# compute relative frequencies of cell types in the T cell compartment
+df_cts <- so@meta.data %>% 
+  group_by(annotation, genotype) %>%
+  tally(name = "n_ann_trt") %>% 
+  group_by(genotype) %>% 
+  mutate(n_trt = sum(n_ann_trt),
+         pct_ann = n_ann_trt / n_trt * 100, 
+         y_pos = 100 - (cumsum(pct_ann) - pct_ann/2),
+         label = paste0(sprintf("%.1f", pct_ann), "%"))
+p_pct <- ggplot(df_cts) +
+  geom_bar(aes(x = genotype, y = pct_ann, fill = annotation), stat = "identity", position = "stack", width = 0.7) +
+  geom_text(aes(x = genotype, y = y_pos, label = label)) +
+  scale_fill_manual(values = color_celltype[levels(df_cts$annotation)]) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(fill = "Annotation", x = "", y = "Percent of cells") +
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12))
+
+# test change in cell abundance
+is_ko <- df_cts$genotype == "Pglyrp1-/-"
+is_wt <- df_cts$genotype == "WT"
+test_out <- sapply(levels(df_cts$annotation), function(ann) {
+  is_ann <- df_cts$annotation == ann
+  ct_mtx <- rbind(df_cts[is_ko & is_ann, c("n_ann_trt", "n_trt")], df_cts[is_wt & is_ann, c("n_ann_trt", "n_trt")])
+  ct_mtx[,"n_trt"] <- ct_mtx[,"n_trt"] - ct_mtx[,"n_ann_trt"]
+  c(OR = as.numeric(ct_mtx[1,1] * ct_mtx[2,2] / ct_mtx[1,2] / ct_mtx[2,1]), pval = chisq.test(ct_mtx)$p.value)
+})
+plt_df <- data.frame(t(test_out)) %>% 
+  rownames_to_column(var = "Annotation") %>% 
+  mutate(Annotation = droplevels(factor(Annotation, levels = celltype_vec)),
+         padj = p.adjust(pval, method = "bonferroni"),
+         padj_mapped = paste0("p=", formatC(padj, format = "E", digits = 2)))
+p_test <- ggplot(plt_df, aes(x = Annotation,  y = log2(OR),fill = Annotation, label = padj_mapped)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  geom_hline(yintercept = 0) +
+  geom_text(aes(y = ifelse(OR > 1, -1.3, 0.1)), color = "black", hjust = 0) +
+  coord_flip() +
+  scale_x_discrete(limits = rev) +
+  scale_fill_manual(values = color_celltype[levels(plt_df$Annotation)]) +
+  scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.3)) +
+  theme_classic() +
+  labs( y = "Log2 odds ratio", x = "") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank())
+
+pdf("3d_barplot_cluster_freq.pdf", width = 8, height = 4)
+plot_grid(p_pct + theme(legend.position = "none"), 
+          p_test, 
+          nrow = 1, align = "h", rel_widths = c(0.25, 0.75))
+dev.off()
+```
+
+### Figure 3e
+Overview of the WT and Pglyrp1-/- cell distributions.
+```{r}
+plt_df <- data.frame(so@meta.data[,"genotype",drop = FALSE], 
+                     Embeddings(so, reduction = "umap"))
+p_gt <- ggplot(plt_df, aes(x = UMAP_1, y = UMAP_2, color = genotype)) +
+  geom_point(size = 0.5) +
+  labs(color = "Genotype") +
+  scale_color_manual(values = color_genotype[levels(plt_df$genotype)]) +
+  guides(color = guide_legend(override.aes = list(size = 2))) +
+  coord_fixed() +
+  theme_classic() 
+pdf("3e_umap_genotype.pdf", width = 6, height = 4)
+p_gt
+dev.off()
+```
+
+
+### Figure 3f
+Differentially expressed genes between WT and Pglyrp1-/- in Stem-like CD8+ T cells.
+```{r}
+de_res <- readRDS("1_diff_expr_WT_vs_KO_by_cluster.rds")
+genes_to_plot <- c("Cd69", "Icam1", "Irgm1", "Jak2", "Stat1", "Il18rap", "Prf1", "Tbx21", "Ifi206", "Ifi47", "Irf1", "Cd160", # up in Pglyrp1-/-
+                   "Ifngr1", "Ccr9", "Cd52", "Cd96", "Ikzf2", "Il6st", "Itgae", "Tcf7", "Ccr7") # up in WT
+thresh_padj <- 0.05
+thresh_lfc <- 0.25
+
+min_range_abs <- 1.5
+min_logFC <- -min_range_abs
+max_logFC <- min_range_abs
+min_nlog10p <- 0
+max_nlog10p <- 20
+
+
+plt_df <- de_res$`Stem-like CD8+ T cells`$table %>% 
+  rownames_to_column(var = "gene") %>% 
+  mutate(logFC_cap = pmax(pmin(logFC, max_logFC), min_logFC),
+         nlog10p = -log10(PValue),
+         nlog10p_cap = pmax(pmin(nlog10p, max_nlog10p, na.rm = T), min_nlog10p, na.rm = T),
+         up_in = ifelse(FDR >= thresh_padj, "NS", 
+                        ifelse(logFC > thresh_lfc, "Pglyrp1-/-", 
+                               ifelse(logFC < -thresh_lfc, "WT", "NS"))) %>% factor(levels = c("Pglyrp1-/-", "WT", "NS")),
+         label = ifelse(gene %in% genes_to_plot, gene, 
+                        ifelse((rank(logFC) <= 5) | (rank(-logFC) <= 5), gene, NA)), # Also show top DE genes
+         # frame_type = paste0(up_in, "_", is.na(label)),
+         frame_type = ifelse(is.na(label), as.character(up_in), "highlight")) %>% 
+  arrange(-as.numeric(up_in), -is.na(label))
+
+p <- ggplot(plt_df, aes(x = logFC_cap, y = nlog10p_cap, fill = up_in, label = label)) +
+  geom_point(aes(color = frame_type), shape = 21) +
+  geom_text_repel(size = 4, show.legend = FALSE, min.segment.length = 0.1, color = "black") +
+  scale_fill_manual(values = c(color_genotype, "NS" = "grey85")) +
+  scale_color_manual(values = c("highlight" = "#F2CF5D", color_genotype, "NS" = "grey85"), guide = "none") +
+  scale_size_manual(values = c("Pglyrp1-/-" = 1, "WT" = 1, "NS" = 0.5), guide = "none") +
+  guides(fill = guide_legend(override.aes = list(color = NA, size = c(4, 4, 4)))) +
+  labs(x = "Log2 Fold Change (Pglyrp1-/- vs. WT)", y = "-log10(pvalue)", fill = "Upregulated in") +
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12))
+
+pdf("3f_volcano_WT_vs_KO_stem_like_CD8.pdf", width = 7, height = 5)
+p
+dev.off()
+
+```
+
+### Supplementary Figure 5d
+Differentially expressed genes between WT and Pglyrp1-/- in Tregs. Set the axes range to be the same as Figure 3f to facilitate visual comparisons.
+```{r}
+de_res <- readRDS("1_diff_expr_WT_vs_KO_by_cluster.rds")
+genes_to_plot <- c("Ly6a", "Rnmt", "Tnfsf8", # up in Pglyrp1-/-
+                   "Arpc2", "Vps13c", "Tgfbr1", "Sec16a", "Nt5e", "Slc1a5", "Il18r1", "Itgae") # up in WT
+
+thresh_padj <- 0.05
+thresh_lfc <- 0.25
+
+min_range_abs <- 1.5
+min_logFC <- -min_range_abs
+max_logFC <- min_range_abs
+min_nlog10p <- 0
+max_nlog10p <- 20
+
+plt_df <- de_res$Tregs$table %>% 
+  rownames_to_column(var = "gene") %>% 
+  mutate(logFC_cap = pmax(pmin(logFC, max_logFC), min_logFC),
+         nlog10p = -log10(PValue),
+         nlog10p_cap = pmax(pmin(nlog10p, max_nlog10p, na.rm = T), min_nlog10p, na.rm = T),
+         up_in = ifelse(FDR >= thresh_padj, "NS", 
+                        ifelse(logFC > thresh_lfc, "Pglyrp1-/-", 
+                               ifelse(logFC < -thresh_lfc, "WT", "NS"))) %>% factor(levels = c("Pglyrp1-/-", "WT", "NS")),
+         label = ifelse(gene %in% genes_to_plot, gene, 
+                        ifelse((rank(logFC) <= 5) | (rank(-logFC) <= 5), gene, NA)), # Also show top DE genes
+         # frame_type = paste0(up_in, "_", is.na(label)),
+         frame_type = ifelse(is.na(label), as.character(up_in), "highlight")) %>% 
+  arrange(-as.numeric(up_in), -is.na(label))
+
+p <- ggplot(plt_df, aes(x = logFC_cap, y = nlog10p_cap, fill = up_in, label = label)) +
+  geom_point(aes(color = frame_type), shape = 21) +
+  geom_text_repel(size = 4, show.legend = FALSE, min.segment.length = 0.1, color = "black") +
+  scale_fill_manual(values = c(color_genotype, "NS" = "grey85")) +
+  scale_color_manual(values = c("highlight" = "#F2CF5D", color_genotype, "NS" = "grey85"), guide = "none") +
+  scale_size_manual(values = c("Pglyrp1-/-" = 1, "WT" = 1, "NS" = 0.5), guide = "none") +
+  guides(fill = guide_legend(override.aes = list(color = NA, size = c(4, 4, 4)))) +
+  labs(x = "Log2 Fold Change (Pglyrp1-/- vs. WT)", y = "-log10(pvalue)", fill = "Upregulated in") +
+  theme_classic() +
+  ylim(min_nlog10p, max_nlog10p) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12))
+
+pdf("s5d_volcano_WT_vs_KO_Tregs.pdf", width = 7, height = 5)
+p
+dev.off()
+```
+
+
+### Figure 3g
+Gene set enrichment analysis of WT and Pglyrp1-/- specific genes in Stem-like CD8+ T cells. As noted above for Supplementary Figure 5b, the numerical results may be slightly different from those shown in the paper due to the inherent randomness of fGSEA.
+```{r}
+de_res <- readRDS("1_diff_expr_WT_vs_KO_by_cluster.rds")
+
+# load gene sets
+sink("/dev/null") #suppress verbose outputs
+gs_raw <- list(
+  "KeggReactome" = GSA.read.gmt("../../0_data/gene_lists/from_msigdb/c2.kegg.reactome.v7.0.symbols.gmt"),
+  "GoTerms" = GSA.read.gmt("../../0_data/gene_lists/from_msigdb/c5.all.v7.0.symbols.gmt"),
+  "c7Immune" = GSA.read.gmt("../../0_data/gene_lists/from_msigdb/c7.all.v7.0.symbols.gmt"),
+  "Literature" = GSA.read.gmt("../../0_data/gene_lists/literature.symbols.gmt")
+)
+sink()
+## add exhaustion related signatures to "Literature"
+f_exh <- "../../0_data/gene_lists/exhaustion_signatures.xlsx"
+sig_ex_info <- read.xlsx(f_exh, sheet = "info")
+sig_ex_ls <- lapply(sig_ex_info$sheet_name, function(x) {
+  read.xlsx(f_exh, sheet = x, colNames = FALSE)[,1]
+})
+gs_raw$Literature$genesets <- c(gs_raw$Literature$genesets, sig_ex_ls)
+gs_raw$Literature$geneset.names <- c(gs_raw$Literature$geneset.names, sig_ex_info$signature_name)
+gs_raw$Literature$geneset.descriptions <- c(gs_raw$Literature$geneset.descriptions, sig_ex_info$website)
+
+## perform GSEA 
+all_genes_upper <- toupper(rownames(de_res$`Stem-like CD8+ T cells`$table))
+fgsea_res_ls <- lapply(names(gs_raw), 
+  function(db) {
+    cat(db, "...\n")
+    gs_parsed_db <- lapply(gs_raw[[db]]$genesets, function(x) {
+      intersect(toupper(x), all_genes_upper)
+    }) %>% `names<-`(gs_raw[[db]]$geneset.names)
+    de_stat <- de_res$`Stem-like CD8+ T cells`$table$`F` * ((de_res$`Stem-like CD8+ T cells`$table$logFC > 0) * 2 - 1) # polarize based on DE direction
+    names(de_stat) <- all_genes_upper
+    fgsea_results <- fgsea(pathways = gs_parsed_db, stats = de_stat)
+    fgsea_results %>% 
+      mutate(database = db) %>% 
+      arrange(pval)
+}) %>% `names<-`(names(gs_raw))
+saveRDS(fgsea_res_ls, "1_gsea_KO_vs_WT_stem_like_CD8.rds")
+```
+
+Visualize enrichment results using bar plots. The terms to plot were selected based on statistical significance and biological relevance. They can be found in "gsea_terms_to_plot_KO_vs_WT_stem_like_CD8.csv".
+```{r}
+fgsea_res_ls <- readRDS("1_gsea_KO_vs_WT_stem_like_CD8.rds")
+to_plot <- read.csv("gsea_terms_to_plot_KO_vs_WT_stem_like_CD8.csv")
+map_pval <- function(p_vec) {
+  p_mapped <- paste0("p=", formatC(p_vec, format = "E", digits = 2))
+  return(p_mapped)
+}
+
+plt_df <- Reduce(union, fgsea_res_ls) %>% 
+  merge(., to_plot, by = "pathway", all = FALSE)  %>% 
+  arrange(NES) %>% 
+  mutate(name_for_plot = factor(name_for_plot, levels = name_for_plot))
+
+p <- ggplot(plt_df, aes(x = name_for_plot, y = NES, fill = up_in)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_hline(yintercept = 0) +
+  geom_text(aes(y = ifelse(NES > 0, -0.8, 0.1), label = map_pval(pval)), hjust = 0) +
+  facet_grid(db_type~., scale = "free", space = "free") +
+  scale_fill_manual(values = color_genotype) +
+  labs(x = "", y = "NES", fill = "") +
+  coord_flip() +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        axis.text.y = element_text(color = "black", size = 12), 
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+pdf("3g_barplot_enrichment_KO_vs_WT_stem_like_CD8.pdf", width = 10, height = 10)
+p
+dev.off()
+```
+
+
+## Session Info
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,103 @@
+---
+title: "Analysis of public scRNA-seq data (human melanoma infiltrating immune cells)"
+output: html_notebook
+---
+
+```{r configuration, echo=FALSE, message=FALSE}
+rm(list = ls())
+library(tidyverse)
+library(Seurat)
+library(openxlsx)
+library(data.table)
+```
+
+## Preprocessing
+
+Expression (TPM matrix) and meta data files were downloaded from GEO. Cell to cluster mapping was obtained from Table 1 in the original paper, cluster annotations were obtained from Figure 1B in the original paper. Original paper info: PMID: 30388456; PMCID: PMC6641984; DOI: 10.1016/j.cell.2018.10.038
+
+```{r}
+f_TPM <- "../../0_data/GSE120575_Sade_Feldman/GSE120575_Sade_Feldman_melanoma_single_cells_TPM_GEO.txt.gz"
+f_meta <- "../../0_data/GSE120575_Sade_Feldman/GSE120575_patient_ID_single_cells.txt.gz"
+f_annot <- "../../0_data/GSE120575_Sade_Feldman/1-s2.0-S0092867418313941-mmc1.xlsx"
+
+## load cell name and sample name
+TPM_header <- read.table(f_TPM, sep = "\t", header = F, fill = F, nrows = 2, stringsAsFactors = FALSE)
+dim(TPM_header) # 1 column of NAs + 16291 cells
+TPM_header[,c(1:5, (ncol(TPM_header)-4):ncol(TPM_header))]
+cell_names <- TPM_header[1,-1] # select first row and remove the NA in the first column
+
+## load expression data
+TPM_raw <- fread(f_TPM, sep = "\t", header = F, fill = F, skip = 2, stringsAsFactors = F) %>% # skip first two rows
+  as.matrix(., rownames = 1)
+dim(TPM_raw) # 1629 cells + 1 column of NAs
+TPM_raw[c(1:5, (nrow(TPM_raw)-4):nrow(TPM_raw)),c(1:5, (ncol(TPM_raw)-4):ncol(TPM_raw))]
+TPM_mtx <- as.sparse(TPM_raw[,-ncol(TPM_raw)]) # remove last column (all NAs)
+colnames(TPM_mtx) <- cell_names
+rm(TPM_header, TPM_raw)
+
+## load cell meta data
+meta_df <- read.table(f_meta,sep = "\t", header = T, skip = 19, nrows = 16292)
+head(meta_df)
+meta_df <- meta_df[, colMeans(is.na(meta_df)) != 1]
+rownames(meta_df) <- meta_df$title
+
+## create Seurat object
+so <- CreateSeuratObject(counts = TPM_mtx, project = "Sade_Feldman", meta.data = meta_df)
+rm(TPM_mtx, meta_df)
+
+## cell-to-cluster mapping
+cluster_annot <- read.xlsx(f_annot, sheet = "Cluster annotation-Fig1B-C")
+cluster_annot$Cluster.number <- as.integer(cluster_annot$Cluster.number) # make sure cluster numbers are integers
+head(cluster_annot)
+# parse cell names in Seurat object and Table 1.
+so$title_short <- sub("_myeloid_enriched$|_T_enriched$", "", so$title)
+cluster_annot$Cell.Name_short <- sub("_DN.*$|_DP.*$", "", cluster_annot$Cell.Name)
+# identify cluster ID
+so$cluster_number <- cluster_annot$Cluster.number[match(so$title_short, cluster_annot$Cell.Name_short)]
+table(so$cluster_number, useNA = 'i')
+
+## cluster-to-celltype mapping
+ann_df <- data.frame(cluster = 1:11,
+                     annotation = c("B-cells", "Plasma cells", "Mono/Macs", "Dendritic cells", 
+                                    "Lymphocytes", "Exhausted CD8+ T-cells", 
+                                    "Regulatory T-cells", "Cytotoxicity Lymphocytes", 
+                                    "Exhausted/HS CD8+ T-cells", "Memory T-cells", "Lymphocytes exhausted/cell-cycle"))
+so$annotation <- ann_df$annotation[match(so$cluster_number, ann_df$cluster)] %>% 
+  factor(., levels = ann_df$annotation)
+table(so$annotation, useNA = 'i') %>% data.frame()
+```
+
+## PGLYRP1 expression
+```{r}
+gene_vec <- c("PGLYRP1", "PDCD1", "TIGIT", "CTLA4", "HAVCR2", "LAG3")
+stopifnot(all(gene_vec %in% rownames(so)))
+
+plt_df <- data.frame(celltype = so$annotation,
+                     t(as.matrix(so[["RNA"]]@counts[gene_vec,]))) %>% 
+  gather(key = "gene", value = "TPM", -celltype) %>% 
+  group_by(gene, celltype) %>% 
+  summarise(pct = 100 * mean(TPM > 0)) %>%
+  mutate(gene = factor(gene, levels = gene_vec))
+
+p_bar <- ggplot(plt_df, aes(x = celltype, y = pct)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7, fill = "grey75", color = "black") +
+  facet_wrap(~gene, ncol = 1, scales = "free_y") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0))) +
+  geom_hline(yintercept = 0, linewidth = 1) + # add x axis to all facet panels
+  labs(x = "", y = "Percent of cells") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.background = element_blank(),
+        strip.text = element_text(face = "italic", hjust = 0))
+
+pdf("a_barplot.pdf", width = 4, height = 8)
+p_bar
+dev.off()
+```
+
+
+## Session Info
+```{r}
+sessionInfo()
+```
+

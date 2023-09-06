@@ -1,0 +1,271 @@
+---
+title: "Analysis of public scRNA-seq data (B16 tumor-infiltrating CD8+ T cells)"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r configuration, echo=FALSE, message=FALSE}
+rm(list = ls())
+library(GEOquery)
+library(tidyverse)
+library(Seurat)
+library(ggrepel)
+library(openxlsx)
+library(pheatmap)
+library(gridExtra)
+```
+
+
+
+## Preprocessing
+
+Expression (FPKM matrix) and meta data (series matrix) files were downloaded from GEO. Here we only use scRNA-seq of B16F10 tumor-infiltrating lymphocytes from wild type and IL27ra KO mice (batch 1-5).
+
+```{r}
+dir_data <- "../../0_data/GSE113968_Chihara/"
+gse_vec <- list.files(dir_data, full.names = FALSE, pattern = "series") %>% sub("_.*", "", .)
+## create one Seurat object per batch
+so_ls <- lapply(gse_vec, function(i) {
+  cat(i, "\n")
+  f_vec <- list.files(dir_data, full.names = TRUE, pattern = i)
+  f_mtx <- grep("FPKM", f_vec, value = TRUE)
+  f_meta <- grep("series", f_vec, value = TRUE)
+  batch <- unlist(strsplit(f_mtx, split = "_"))[4]
+  
+  ## parse expression matrix
+  mtx_raw <- read.table(f_mtx, header = T, stringsAsFactors = F, sep = "\t")
+  genes <- mtx_raw$X
+  mtx <- mtx_raw[,-1]
+
+  # process duplicated gene names
+  which_dup <- duplicated(genes) %>% which
+  if (length(which_dup) > 0) {
+    for (j in unique(genes[which_dup])) {
+      to_keep <- setdiff(which(genes == j), which_dup)
+      stopifnot(length(to_keep) == 1)
+      mtx[to_keep,] <- mtx[genes == j,] %>% colSums() # take sum of all rows with same gene name
+    }
+    mtx <- mtx[-which_dup,]
+    rownames(mtx) <- genes[-which_dup]
+  } else {
+    rownames(mtx) <- genes
+  }
+  
+  # parse meta data
+  meta_data_full <- getGEO(file = f_meta) %>% data.frame()
+  meta_data <- meta_data_full %>% 
+    mutate(keep_cell = !grepl("_Population$|_No_Cell$", title)) %>% # remove "population" or "No_Cell" data
+    filter(keep_cell) %>%
+    select(title) %>% 
+    mutate(batch = batch,
+           genotype = ifelse(grepl("_KO", title), "KO", "WT") %>% factor(., levels = c("WT", "KO")), 
+           celltype = ifelse(grepl("_CD4_", title), "CD4", "CD8")) %>% # use title instead of columns because attribute names and data format are different across files.
+    remove_rownames() %>% 
+    column_to_rownames("title")
+  
+  # create object
+  CreateSeuratObject(mtx[,rownames(meta_data)], project = batch, meta.data = meta_data)
+})
+
+# merge all batches
+so_til <- merge(x = so_ls[[1]], y = so_ls[-1])
+
+# double check genotype and celltype labels
+table(so_til$genotype, grepl("WT", colnames(so_til)))
+table(so_til$celltype, grepl("CD8", colnames(so_til)))
+
+# subset to WT CD4+ T cells
+so <- so_til[,so_til$genotype == "WT" & so_til$celltype == "CD8"]
+
+# cell QC
+so[["percent.mt"]] <- PercentageFeatureSet(so, pattern = "^mt-")
+summary(so[["percent.mt"]]) # mitochondrial genes already excluded
+
+VlnPlot(so, features = c("nFeature_RNA", "nCount_RNA"), ncol = 3)
+
+so <- subset(so, 
+             subset = (batch %in% c("R1", "R2") & nFeature_RNA >= 1000 & nCount_RNA >= 250000) | 
+               (batch %in% c("R3", "R4", "R5") & nFeature_RNA >= 2000 & nCount_RNA >= 500000))
+VlnPlot(so, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# remove undetected genes
+so <- so[rowSums(so[["RNA"]]@counts) > 0,]
+dim(so) #[1] 15805   357
+```
+
+
+
+## Coexpression with co-inhibitory or stem-like genes
+
+Related to Figure 1a and Supplementary Table 1.
+
+```{r, warning=FALSE}
+## use known co-inhibitory and stem-like genes as reference
+known_ci <- c("Pdcd1", "Tigit", "Ctla4", "Havcr2", "Lag3") # co-inhibitory
+known_stem <- c("Ccr7", "Cxcr5", "Tcf7", "Sell") # stem-like
+
+so <- NormalizeData(so)
+so <- FindVariableFeatures(so, assay = "RNA") # identify highly variable genes
+
+# average expression profile of known genes ("signature score")
+avg_known_ci <- colSums(so[["RNA"]]@data[known_ci,])
+avg_known_stem <- colSums(so[["RNA"]]@data[known_stem,])
+
+# compute and test Spearman correlation between every highly variable gene and known co-inhibitoy/stem-like genes
+cor_df <- apply(so[["RNA"]]@data[setdiff(so[["RNA"]]@var.features, c(known_ci, known_stem)),], 1, function(x) {
+  test_ci <- cor.test(x, avg_known_ci, method = "spearman")
+  test_stem <- cor.test(x, avg_known_stem, method = "spearman")
+  c("corr_ci" = as.numeric(test_ci$estimate), "pval_ci" = test_ci$p.value,
+    "corr_stem" = as.numeric(test_stem$estimate), "pval_stem" = test_stem$p.value)
+}) %>% t %>% data.frame()
+
+cor_df$fdr_ci <- p.adjust(cor_df$pval_ci, method = "BH")
+cor_df$fdr_stem <- p.adjust(cor_df$pval_stem, method = "BH")
+
+cor_df <- cor_df %>%
+  rownames_to_column(var = "gene") %>% 
+  mutate(rank_corr_ci = rank(-corr_ci), rank_corr_stem = rank(corr_stem)) 
+```
+
+Make Figure 1a.
+```{r, warning=FALSE}
+genes_of_interest <- c(
+  "Pglyrp1",
+  "Cxcr6", "Gapdh", "Gzmb", "Nkg7", "Bhlhe40", "Tnfrsf9", "Prf1", "Irf8", "Gzmk", "Ccl3", "Ccl4", "Nr4a2", "Ifng", "Lilrb4", "Lgals3", # correlated with co-inhibitory
+  "Gpr18", "Samd3", "Tnfsf8", "Itgb7", "Fos", "Gpr15", "Pou2af1", "Il6ra", "Lamp1" # correlated with stem-like
+)
+stopifnot(length(setdiff(genes_of_interest, cor_df$gene)) == 0)
+
+thresh_fdr <- 0.05
+
+cor_df <- cor_df %>%
+  mutate(gene_label = ifelse(gene %in% genes_of_interest, gene, NA)) %>%
+  arrange(-is.na(gene_label)) %>% 
+  mutate(sig_pos_ci = (fdr_ci < thresh_fdr) & (corr_ci > 0),
+         sig_neg_ci = (fdr_ci < thresh_fdr) & (corr_ci < 0),
+         sig_pos_stem = (fdr_stem < thresh_fdr) & (corr_stem > 0),
+         sig_neg_stem = (fdr_stem < thresh_fdr) & (corr_stem < 0),
+         gene_type = ifelse(sig_pos_ci & sig_neg_stem, "co-inhibitory", 
+                            ifelse(sig_neg_ci & sig_pos_stem, "stem-like", NA)))
+
+# speaman rho at significance cutoff
+thresh_corr_ci <- cor_df$corr_ci[which.min(abs(cor_df$fdr_ci - thresh_fdr))]
+thresh_corr_stem <- cor_df$corr_stem[which.min(abs(cor_df$fdr_stem - thresh_fdr))]
+
+g <- ggplot(cor_df, aes(x = corr_stem, y = corr_ci, color = gene_type)) +
+  geom_hline(yintercept = c(-thresh_corr_ci, thresh_corr_ci), color = "grey80", linetype = 2) +
+  geom_vline(xintercept = c(-thresh_corr_stem, thresh_corr_stem), color = "grey80", linetype = 2) +
+  geom_point(aes(size = ifelse(gene == "Pglyrp1", 2, 1)), alpha = 0.5, show.legend = FALSE) +
+  geom_text_repel(aes(label = gene_label, fontface = ifelse(gene == "Pglyrp1", 2, 1)), 
+                  color = "black", show.legend = FALSE, max.overlaps = 10, force = 10, seed = 123211, min.segment.length = 0.1) +
+  scale_color_manual(values = c("co-inhibitory" = "red", "stem-like" = "blue"),
+                     na.value = "grey80", guide = "none") +
+  scale_size(range = c(1, 2)) +
+  labs(y = "Correlation with co-inhibitory genes",
+       x = "Correlation with stem-like genes",
+       color = "") +
+  theme_classic()
+g
+pdf("a_coexpression.pdf", width = 5, height = 4)
+print(g)
+dev.off()
+```
+
+Make Supplemenatry Table 1.
+```{r}
+cor_df_xlsx <- cor_df
+colnames(cor_df_xlsx) <- colnames(cor_df) %>% 
+    sub("ci", "co-inhibitory", .) %>% 
+    sub("stem", "stem-like", .)
+head(cor_df_xlsx)
+write.xlsx(cor_df_xlsx, file = "Table_S1.xlsx")
+```
+
+
+## Expression of known co-inhibitory and stem-like genes 
+
+Figure 1b.
+
+```{r, warning=FALSE}
+genes_of_interest <- c("Pglyrp1", "Pdcd1", "Havcr2", "Lag3", "Tigit", "Ctla4", "Tcf7", "Slamf6", "Sell", "Ccr7", "Cxcr5")
+stopifnot(length(setdiff(genes_of_interest, rownames(so))) == 0)
+
+# scale data across cells
+so <- ScaleData(so, features = rownames(so))
+
+pdf("b_heatmap.pdf", width = 5, height = 3.2)
+pheatmap(so[["RNA"]]@scale.data[genes_of_interest,],
+         breaks = seq(-2, 2, length.out = 100),
+         cluster_row = T,
+         cluster_cols = T,
+         clustering_method = "ward.D",
+         treeheight_row = 20,
+         treeheight_col = 20,
+         cutree_rows = 2,
+         show_rownames = T,
+         show_colnames = F,
+         main = "")
+dev.off()
+```
+## Expression of known co-inhibitory molecules and dysfunction signature
+
+__NOTE:__ the PCA and UMAP cell embeddings may vary for different versions of R packages. Please use coordinates in "pre_computed_reductions.rds" to replicate Figure 1c.
+
+```{r}
+# so <- RunPCA(so)
+# ElbowPlot(so, ndims = 50)
+# pc_dims <- 1:20
+# so <- RunUMAP(so, reduction = "pca", dims = pc_dims, min.dist = 0.3)
+
+## use pre-computed dimension reduction to replicate figure 1c.
+so@reductions <- readRDS("pre_computed_reductions.rds")
+
+# signature: genes upregulated in Tim-3+PD1+ vs Tim-3-PD-1 CD8+ TILs from MC38-Ova tumors
+sig_raw <- read.table("../../0_data/gene_lists/Dysfunction_Kurtulus_2019.txt", stringsAsFactors = F)[,1] 
+sig_parsed <- rownames(so)[match(toupper(sig_raw), toupper(rownames(so)))] %>% setdiff(., NA)
+so <- AddModuleScore(so, features = list(sig_parsed), name = "SIG")
+colnames(so@meta.data)[colnames(so@meta.data) == "SIG1"] <- "Dysfunction"
+```
+
+```{r}
+plt_df <- data.frame(UMAP_1 = so@reductions$umap@cell.embeddings[,1], 
+                     UMAP_2 = so@reductions$umap@cell.embeddings[,2],
+                     Dysfunction = so$Dysfunction) %>% 
+  mutate(dys_norm_rank = rank(Dysfunction) / length(Dysfunction)) 
+
+plist <- list()
+plist_corr <- list()
+plist[["Dysfunction"]] <- plt_df %>% 
+  ggplot(.,  aes(x = UMAP_1, y = UMAP_2, color = dys_norm_rank)) + 
+  geom_point() +
+  scale_color_gradientn(colours = colorRamps::matlab.like2(10)) +
+  labs(color = "Normalized\nsignature score or\ngene expression", title = "Dysfunction Signature") +
+  theme_classic()
+
+g_vec <- c("Pglyrp1", "Pdcd1", "Havcr2", "Lag3", "Tigit")
+for (g in g_vec) {
+  plt_df <- data.frame(UMAP_1 = so@reductions$umap@cell.embeddings[,1], 
+                       UMAP_2 = so@reductions$umap@cell.embeddings[,2],
+                       expr = so[["RNA"]]@data[g,], Dysfunction = so$Dysfunction) %>% 
+    mutate(expr_norm_rank = rank(expr) / length(expr)) 
+  plist[[g]] <- plt_df %>% 
+    ggplot(.,  aes(x = UMAP_1, y = UMAP_2, color = expr_norm_rank)) + 
+    geom_point() +
+    scale_color_gradientn(colours = colorRamps::matlab.like2(10)) +
+    labs(color = "Normalized\nsignature score\nor gene expression", title = paste0(g, "")) +
+    theme_classic()
+}
+
+grobs <- lapply(plist, function(x){x + theme(legend.position = "none")})
+p <- grid.arrange(grobs = grobs, nrow = 2, right = cowplot::get_legend(plist[[1]]))
+pdf(paste0("c_UMAP.pdf"), width = 9, height = 6)
+grid.arrange(p)
+dev.off()
+```
+
+```{r}
+sessionInfo()
+```
+
+

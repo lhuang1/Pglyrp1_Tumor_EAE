@@ -1,0 +1,242 @@
+---
+title: "Analysis of bulk RNA-seq data (tumor-infiltrating CD8+ T cells)"
+output: html_notebook
+---
+
+We generated bulk RNA-seq data for tumor-infiltrating CD8+ T cells from WT and Pglyrp1 KO mice using the Smart-seq2 protocol. The raw and processed data were uploaded to SRA and GEO: GSE223872. Specifically, "GSE223872_TPM_normalized_count.txt.gz" contains the TPM-normalized counts calculated as follows: (according to https://cumulus.readthedocs.io/en/stable/smart_seq_2.html)
+
+  1. Estimate the gene expression levels in TPM using RSEM.
+  
+  2. Suppose `c` reads are achieved for one cell, then calculate TPM-normalized count for gene `i` as `TPM_i / 1e6 * c`.
+
+
+```{r, message=FALSE}
+rm(list = ls())
+library(tidyverse)
+library(edgeR)
+library(ggrepel)
+library(openxlsx)
+library(DESeq2)
+library(pheatmap)
+library(grid)
+library(GSA)
+library(fgsea)
+```
+
+
+## Preprocess data
+
+```{r}
+# load expression matrix
+mtx <- read.table("../../0_data/GSE223872_tumor_bulk_RNAseq/GSE223872_TPM_normalized_count.txt.gz",
+                  sep = "\t", header = TRUE, row.names = 1)
+head(mtx)
+
+# parse matrix column names into meta data df
+meta_df <- data.frame(
+  Condition = ifelse(grepl("ko", colnames(mtx)), "Pglyrp1-/-", "WT") %>% factor(., levels = c("WT", "Pglyrp1-/-"))
+) %>% `rownames<-`(colnames(mtx))
+```
+
+## Differential expression
+
+Related to Figure 2h and Supplementary Table 2.
+
+We perform DE analysis on a subset of genes and use a lose threshold (FDR < 0.1) to call DE genes because we have relatively low statistical power due to low sequencing depth. The gene subset contains protein coding genes that were obtained and parsed from supplementary data of GSE126917 (annotated based on GENCODE V10). This subset may not be optimal, therefore we also performed DE using several other gene sets (e.g. all genes, all known genes, all mouse protein coding genes) and obtained very similar results. Use the gene list provided in `genes_for_diff_expr.csv` to replicate Figure 2h and Supplementary Table 2.
+
+```{r}
+# create a DGEList object for edgeR
+dge <- DGEList(counts = mtx, samples = meta_df)
+# filter out genes with very low expression
+dge <- dge[rowSums(dge$counts) >= 10,]
+# subset genes
+gene_subset <- read.csv("genes_for_diff_expr.csv", header = FALSE, stringsAsFactors = FALSE)[,1] %>% 
+  intersect(., rownames(dge))
+dge <- dge[gene_subset,]
+
+# DE
+dge <- calcNormFactors(dge)
+design <- model.matrix(~ Condition, data = dge$samples)
+dge <- estimateDisp(dge, design = design)
+fit <- glmFit(dge, design = design)
+lrt <- glmLRT(fit, coef = 2)
+res_edger <- topTags(lrt, n = Inf, adjust.method = "BH", sort.by = "none", p.value = 1)
+```
+
+
+```{r}
+genes_of_interest <- c("Nr4a2", "Prf1", "Lag3", "Ramp3", "Cxcl9", "Irf8", "Tnfrsf9", "Ccl22", "Ccl4",
+                       "Lilrb4", "Atf3", "Cxcl16", "Pdpn", "Irf4", "Ifng", "Havcr2", "Procr", "Tigit", 
+                       "Maf", "Pglyrp1", "Igflr1", "Prkd2", "Cib3")
+thresh_padj <- 0.15
+thresh_lfc <- 1
+lim_lfc <- max(abs(quantile(res_edger$table$logFC, c(0.001, 0.999))))
+lim_pval <- quantile(res_edger$table$PValue, 0.001, na.rm = T)
+plt_df <- res_edger$table %>% rownames_to_column(var = "gene") %>% 
+  mutate(logFC_cap = pmax(pmin(logFC, lim_lfc), -lim_lfc),
+         PValue_cap = pmax(PValue, lim_pval),
+         up_in = ifelse(FDR >= thresh_padj, "NS", 
+                        ifelse(logFC > thresh_lfc, "Pglyrp1-/-", 
+                               ifelse(logFC < -thresh_lfc, "WT", "NS"))) %>% factor(levels = c("Pglyrp1-/-", "WT", "NS")),
+         label = ifelse(gene %in% genes_of_interest, gene, NA),
+         frame_type = paste0(up_in, "_", is.na(label))) %>% 
+  arrange(-is.na(label))
+
+
+p <- ggplot(plt_df, aes(x = logFC, y = -log10(PValue_cap), fill = up_in, label = label)) +
+  geom_point(aes(color = frame_type), shape = 21) +
+  geom_text_repel(size = 4, show.legend = FALSE, min.segment.length = 0.1, color = "black") +
+  scale_fill_manual(values = c("Pglyrp1-/-" = rgb(67, 145, 214, maxColorValue = 255), 
+                             "WT" = rgb(65, 64, 66, maxColorValue = 255), 
+                             "NS" = rgb(189, 190, 192, maxColorValue = 255))) +
+  scale_color_manual(values = c("Pglyrp1-/-_FALSE" = rgb(242, 207, 93, maxColorValue = 255),
+                                "WT_FALSE" = rgb(242, 207, 93, maxColorValue = 255),
+                                "NS_FALSE" = rgb(242, 207, 93, maxColorValue = 255),
+                                "Pglyrp1-/-_TRUE" = rgb(67, 145, 214, maxColorValue = 255),
+                                "WT_TRUE" = rgb(65, 64, 66, maxColorValue = 255),
+                                "NS_TRUE" = rgb(189, 190, 192, maxColorValue = 255)), guide = "none") +
+  scale_size_manual(values = c("Pglyrp1-/-" = 1, "WT" = 1, "NS" = 0.5), guide = "none") +
+  guides(fill = guide_legend(override.aes = list(color = NA, size = c(4, 4, 4)))) +
+  labs(x = "Log2 Fold Change (Pglyrp1-/- vs. WT)", y = "-log10(pvalue)", fill = "Upregulated in") +
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12))
+p
+
+pdf("h_volcano.pdf", width = 7, height = 5)
+p
+dev.off()
+```
+
+Table S2.
+```{r}
+res_df_xlsx <- res_edger$table %>% rownames_to_column("gene")
+write.xlsx(res_df_xlsx, file = "Table_S2.xlsx")
+```
+
+
+
+## Expression of genes of interest
+
+Related to Figure 2i.
+
+```{r}
+genes_of_interest <- c("Pglyrp1", "Igflr1", "Nr4a2", "Ramp3", "Prf1", "Lag3", "Tnfrsf9", "Lilrb4", "Atf3", "Pdpn", "Ifng", "Havcr2", "Procr", "Tigit", "Maf")
+
+dds <- DESeqDataSetFromMatrix(countData = mtx, colData = meta_df, design = ~Condition)
+vsd <- vst(dds)
+plt_mtx <- t(assay(vsd)[genes_of_interest,order(meta_df$Condition)]) %>% scale() # show wt samples first
+
+## adjust angle of x axis text
+# according to https://stackoverflow.com/questions/15505607/diagonal-labels-orientation-on-x-axis-in-heatmaps
+# For pheatmap_1.0.8 and later:
+draw_colnames_180 <- function (coln, gaps, ...) {
+    coord = pheatmap:::find_coordinates(length(coln), gaps)
+    x = coord$coord - 0.5 * coord$size
+    res = textGrob(coln, x = x, y = unit(1, "npc") - unit(3,"bigpts"), vjust = 0.5, hjust = 1, rot = 90, gp = gpar(...))
+    return(res)}
+
+## 'Overwrite' default draw_colnames with your own version 
+assignInNamespace(x="draw_colnames", value="draw_colnames_180",
+ns=asNamespace("pheatmap"))
+
+pdf("i_heatmap.pdf", width = 7, height = 3)
+p <- pheatmap(plt_mtx,
+         cluster_rows = F, cluster_cols = F,
+         color = colorRampPalette(c("steelblue", "white", "red"))(101),
+         breaks = seq(-2, 2, length.out = 100),
+         scale = "none",
+         gaps_row = cumsum(table(meta_df$Condition)),
+         annotation_row = meta_df,
+         annotation_colors = list("Condition" = c("WT" = "grey90", "Pglyrp1-/-" = "grey40")),
+         annotation_names_row = FALSE,
+         silent = F)
+dev.off()
+
+```
+
+## Gene Set Enrichment Analysis
+
+Related to Figure 2j and 2k.
+
+```{r}
+sink("/dev/null") #suppress verbose outputs
+gs_raw <- list(
+  "KeggReactome" = GSA.read.gmt("../../0_data/gene_lists/from_msigdb/c2.kegg.reactome.v7.0.symbols.gmt"),
+  "GoTerms" = GSA.read.gmt("../../0_data/gene_lists/from_msigdb/c5.all.v7.0.symbols.gmt"),
+  "c7Immune" = GSA.read.gmt("../../0_data/gene_lists/from_msigdb/c7.all.v7.0.symbols.gmt"),
+  "Literature" = GSA.read.gmt("../../0_data/gene_lists/literature.symbols.gmt")
+)
+sink()
+
+## perform GSEA 
+thresh_pval <- 0.1 # upper limit for reporting
+all_genes_upper <- toupper(rownames(res_edger$table))
+fgsea_res_ls <- lapply(names(gs_raw), 
+  function(db) {
+    cat(db, "...\n")
+    gs_parsed_db <- lapply(gs_raw[[db]]$genesets, function(x) {
+      intersect(toupper(x), all_genes_upper)
+    }) %>% `names<-`(gs_raw[[db]]$geneset.names)
+    de_stat <- res_edger$table$LR * ((res_edger$table$logFC > 0) * 2 - 1) # polarize based on DE direction
+    names(de_stat) <- all_genes_upper
+    fgsea_results <- fgsea(pathways = gs_parsed_db, stats = de_stat)
+    fgsea_results %>% 
+      arrange(pval) %>% 
+      filter(pval < thresh_pval)
+}) %>% `names<-`(names(gs_raw))
+```
+
+
+Visualize GSEA results for selected gene sets. Selection was based on test significance and biological relevance. Selected terms are available in "gsea_terms_to_plot.csv". Note that the numerical results may be different from those shown in the paper, and may even vary slightly at every run. This is because the fGSEA package has randomness from various sources, such as permutations, arbitrary ordering of ties in the GSEA preranked stats (see fGSEA documentation). Regardless, the overall conclusions should be consistent.
+
+```{r}
+to_plot <- read.csv("gsea_terms_to_plot.csv")
+# helper function to parse p-value for plotting
+map_pval <- function(p_vec) {
+  p_mapped <- paste0("p=", formatC(p_vec, format = "E", digits = 2))
+  return(p_mapped)
+}
+
+# make bar plots
+plist_p <- list()
+for (db_type in unique(to_plot$db_type)) {
+  if (db_type == "KEGG_GO") {
+    db_vec <- c("KeggReactome", "GoTerms")
+  } else if (db_type == "Imm_Lit") {
+    db_vec <- c("c7Immune", "Literature")
+  }
+  results_sub <- Reduce(rbind, fgsea_res_ls[db_vec]) %>% 
+    merge(., to_plot, by = "pathway", all = FALSE)  %>% 
+    arrange(NES) %>% 
+    mutate(name_for_plot = factor(name_for_plot, levels = name_for_plot))
+  
+  plist_p[[db_type]] <- ggplot(results_sub, aes(x = name_for_plot, y = NES)) +
+    geom_bar(stat = "identity", width = 0.5, fill = "steelblue2") +
+    geom_text(aes(y = 0.1, label = map_pval(pval)), color = "white", hjust = 0) +
+    geom_hline(yintercept = 0) +
+    labs(x = "", y = "NES", fill = "") +
+    coord_flip() +
+    theme_classic() +
+    theme(axis.text.y = element_text(color = "black", size = 12), 
+          axis.line.y = element_blank(),
+          axis.ticks.y = element_blank())
+}
+
+pdf("j_enrichment_kegg_go.pdf", width = 7, height = 5)
+plist_p$KEGG_GO
+dev.off()
+
+pdf("k_enrichment_imm_lit.pdf", width = 7, height = 5)
+plist_p$Imm_Lit
+dev.off()
+```
+
+## Session Info
+```{r}
+sessionInfo()
+```
+
